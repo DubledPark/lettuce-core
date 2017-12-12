@@ -1,5 +1,5 @@
 /*
- * Copyright 2011-2016 the original author or authors.
+ * Copyright 2011-2017 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,24 +16,23 @@
 package io.lettuce.core.masterslave;
 
 import java.io.Closeable;
+import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import io.lettuce.core.ConnectionFuture;
 import io.lettuce.core.RedisClient;
-import io.lettuce.core.RedisConnectionException;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.codec.StringCodec;
+import io.lettuce.core.internal.AsyncCloseable;
 import io.lettuce.core.internal.LettuceLists;
 import io.lettuce.core.protocol.LettuceCharsets;
 import io.lettuce.core.pubsub.RedisPubSubAdapter;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
-
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -45,14 +44,14 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
  * @author Mark Paluch
  * @since 4.2
  */
-class SentinelTopologyRefresh implements Closeable {
+class SentinelTopologyRefresh implements AsyncCloseable, Closeable {
 
     private static final InternalLogger LOG = InternalLoggerFactory.getInstance(SentinelTopologyRefresh.class);
     private static final StringCodec CODEC = new StringCodec(LettuceCharsets.ASCII);
     private static final Set<String> PROCESSING_CHANNELS = new HashSet<>(
             Arrays.asList("failover-end", "failover-end-for-timeout"));
 
-    private final Map<RedisURI, StatefulRedisPubSubConnection<String, String>> pubSubConnections = new ConcurrentHashMap<>();
+    private final Map<RedisURI, ConnectionFuture<StatefulRedisPubSubConnection<String, String>>> pubSubConnections = new ConcurrentHashMap<>();
     private final RedisClient redisClient;
     private final List<RedisURI> sentinels;
     private final List<Runnable> refreshRunnables = new CopyOnWriteArrayList<>();
@@ -66,6 +65,7 @@ class SentinelTopologyRefresh implements Closeable {
 
     private final PubSubMessageActionScheduler topologyRefresh;
     private final PubSubMessageActionScheduler sentinelReconnect;
+    private final CompletableFuture<Void> closeFuture = new CompletableFuture<>();
 
     private volatile boolean closed = false;
 
@@ -77,69 +77,130 @@ class SentinelTopologyRefresh implements Closeable {
                 new TopologyRefreshMessagePredicate(masterId));
         this.sentinelReconnect = new PubSubMessageActionScheduler(redisClient.getResources().eventExecutorGroup(),
                 new SentinelReconnectMessagePredicate());
-
     }
 
     @Override
     public void close() {
+        closeAsync().join();
+    }
+
+    @Override
+    public CompletableFuture<Void> closeAsync() {
+
+        if (closed) {
+            return closeFuture;
+        }
 
         closed = true;
 
-        HashMap<RedisURI, StatefulRedisPubSubConnection<String, String>> connections = new HashMap<>(pubSubConnections);
-        connections.forEach((k, c) -> {
-            c.removeListener(adapter);
-            c.close();
+        HashMap<RedisURI, ConnectionFuture<StatefulRedisPubSubConnection<String, String>>> connections = new HashMap<>(
+                pubSubConnections);
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        connections.forEach((k, f) -> {
+
+            futures.add(f.exceptionally(t -> null).thenCompose(c -> {
+
+                if (c == null) {
+                    return CompletableFuture.completedFuture(null);
+                }
+                c.removeListener(adapter);
+                return c.closeAsync();
+            }).toCompletableFuture());
+
             pubSubConnections.remove(k);
         });
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((aVoid, throwable) -> {
+
+            if (throwable != null) {
+                closeFuture.completeExceptionally(throwable);
+            } else {
+                closeFuture.complete(null);
+            }
+        });
+
+        return closeFuture;
     }
 
-    void bind(Runnable runnable) {
+    CompletionStage<Void> bind(Runnable runnable) {
 
         refreshRunnables.add(runnable);
 
-        initializeSentinels();
+        return initializeSentinels();
     }
 
-    private void initializeSentinels() {
+    private CompletionStage<Void> initializeSentinels() {
 
         if (closed) {
-            return;
+            return closeFuture;
         }
 
-        AtomicReference<RedisConnectionException> ref = new AtomicReference<>();
+        List<ConnectionFuture<StatefulRedisPubSubConnection<String, String>>> connectionFutures = new ArrayList<>();
 
-        sentinels.forEach(redisURI -> {
+        Duration timeout = RedisURI.DEFAULT_TIMEOUT_DURATION;
+        for (RedisURI sentinel : sentinels) {
 
-            if (closed) {
-                return;
+            if (!pubSubConnections.containsKey(sentinel)) {
+
+                ConnectionFuture<StatefulRedisPubSubConnection<String, String>> future = redisClient.connectPubSubAsync(CODEC,
+                        sentinel);
+                timeout = sentinel.getTimeout();
+                pubSubConnections.put(sentinel, future);
+
+                future.whenComplete((connection, throwable) -> {
+
+                    if (throwable != null || closed) {
+                        pubSubConnections.remove(sentinel);
+                    }
+
+                    if (closed) {
+                        connection.closeAsync();
+                    }
+                });
+
+                connectionFutures.add(future);
             }
+        }
 
-            StatefulRedisPubSubConnection<String, String> pubSubConnection = null;
-            try {
-                if (!pubSubConnections.containsKey(redisURI)) {
+        if (connectionFutures.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
 
-                    pubSubConnection = redisClient.connectPubSub(CODEC, redisURI);
-                    pubSubConnections.put(redisURI, pubSubConnection);
+        SentinelTopologyRefreshConnections collector = new SentinelTopologyRefreshConnections(connectionFutures.size());
 
-                    pubSubConnection.addListener(adapter);
-                    pubSubConnection.async().psubscribe("*");
-                }
-            } catch (RedisConnectionException e) {
-                if (ref.get() == null) {
-                    ref.set(e);
+        if (closed) {
+            return closeAsync();
+        }
+
+        for (ConnectionFuture<StatefulRedisPubSubConnection<String, String>> connectionFuture : connectionFutures) {
+
+            connectionFuture.thenCompose(connection -> {
+                connection.addListener(adapter);
+                return connection.async().psubscribe("*").thenApply(v -> connection).whenComplete((c, t) -> {
+
+                    if (t != null) {
+                        connection.closeAsync();
+                    }
+                });
+            }).whenComplete((connection, throwable) -> {
+
+                if (throwable != null) {
+                    collector.accept(throwable);
                 } else {
-                    ref.get().addSuppressed(e);
+                    collector.accept(connection);
                 }
+            });
+        }
+
+        CompletionStage<SentinelTopologyRefreshConnections> completionStage = collector.getOrTimeout(timeout, redisClient
+                .getResources().eventExecutorGroup());
+
+        return completionStage.whenComplete((aVoid, throwable) -> {
+
+            if (throwable != null) {
+                closeAsync();
             }
-        });
-
-        if (sentinels.isEmpty() && ref.get() != null) {
-            throw ref.get();
-        }
-
-        if (closed) {
-            close();
-        }
+        }).thenApply(noop -> (Void) null);
     }
 
     private void processMessage(String pattern, String channel, String message) {

@@ -109,7 +109,7 @@ public class MasterSlaveConnectionProvider<K, V> {
 
                 return getConnection(selection.get(0));
             } catch (RuntimeException e) {
-                throw new RedisException(e);
+                throw Exceptions.bubble(e);
             }
         }
 
@@ -160,7 +160,7 @@ public class MasterSlaveConnectionProvider<K, V> {
             StatefulRedisConnection<K, V> connection = connections.get(connectionKey);
             if (connection != null) {
                 connections.remove(connectionKey);
-                connection.close();
+                connection.closeAsync();
             }
         }
 
@@ -180,7 +180,7 @@ public class MasterSlaveConnectionProvider<K, V> {
 
     /**
      * Close all connections asynchronously.
-     * 
+     *
      * @since 5.1
      */
     @SuppressWarnings("unchecked")
@@ -271,6 +271,7 @@ public class MasterSlaveConnectionProvider<K, V> {
             }
             builder.withDatabase(initialRedisUri.getDatabase());
 
+            // TODO: Make me async
             StatefulRedisConnection<K, V> connection = redisClient.connect(redisCodec, builder.build());
 
             synchronized (stateLock) {
